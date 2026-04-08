@@ -1,434 +1,376 @@
-import torch
+import os
+import sys
+import time
+import logging
+import threading
 import numpy as np
 import scipy.io.wavfile as wav
-import os
-import time
-from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from typing import Any, Dict, Tuple, Optional, List
 
-def _to_audio_tuple(audio):
-    """将ComfyUI的AUDIO输入转换为(audio_tensor, sample_rate)元组"""
+# ===================== 全局配置（匹配你的参考代码） =====================
+logger = logging.getLogger(__name__)
+_MODEL_CACHE: Dict[Tuple[str, str, str], Any] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+_DEFAULT_OMNIVOICE_DIR = "models/OmniVoice"
+_SUPPORTED_DEVICES = ["auto", "cuda", "cpu"]
+_SUPPORTED_DTYPES = ["float16", "float32"]
+_SUPPORTED_LANGUAGES = ["Auto", "zh", "en", "ja", "ko"]
+_OUTPUT_DIR = "output/omnivoice"
+
+# ===================== 懒加载依赖（匹配你的参考代码） =====================
+def _import_torch():
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError(
+            "PyTorch 未安装！请在 ComfyUI 环境中安装 torch 和 torchaudio。"
+        ) from exc
+    return torch
+
+def _import_omnivoice():
+    try:
+        from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+    except ImportError as exc:
+        raise ImportError(
+            f"OmniVoice 导入失败！错误信息：{exc}"
+        ) from exc
+    return OmniVoice, OmniVoiceGenerationConfig
+
+def _get_folder_paths_module():
+    try:
+        import folder_paths
+    except ImportError:
+        return None
+    return folder_paths
+
+# ===================== 路径/设备/精度解析（匹配你的参考代码） =====================
+def _resolve_model_path(model_path: str) -> str:
+    model_path = model_path.strip().replace("\\", "/")
+    if os.path.isabs(model_path):
+        return model_path
+
+    folder_paths = _get_folder_paths_module()
+    if folder_paths and hasattr(folder_paths, "models_dir"):
+        comfy_model_path = os.path.join(folder_paths.models_dir, model_path)
+        if os.path.exists(comfy_model_path):
+            return os.path.abspath(comfy_model_path)
+
+    abs_path = os.path.abspath(model_path)
+    if os.path.exists(abs_path):
+        return abs_path
+
+    default_path = os.path.abspath(_DEFAULT_OMNIVOICE_DIR)
+    if os.path.exists(default_path):
+        logger.warning(f"模型路径不存在，使用默认路径：{default_path}")
+        return default_path
+
+    raise FileNotFoundError(f"模型路径不存在：{model_path}")
+
+def _resolve_device(device: str) -> str:
+    torch = _import_torch()
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if device not in _SUPPORTED_DEVICES:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        return "cpu"
+    return device
+
+def _resolve_dtype(dtype_str: str) -> Any:
+    torch = _import_torch()
+    if dtype_str == "float16":
+        return torch.float16
+    elif dtype_str == "float32":
+        return torch.float32
+    return torch.float16
+
+# ===================== 标准化音频处理（匹配你的参考代码） =====================
+def _to_audio_tuple(audio: Dict[str, Any]) -> Tuple[Any, int]:
     if audio is None:
-        raise ValueError("参考音频输入为空。")
+        raise ValueError("参考音频输入为空！")
     if not isinstance(audio, dict):
-        raise TypeError("预期ComfyUI AUDIO输入为字典格式。")
+        raise TypeError(f"音频必须为字典类型，当前类型：{type(audio)}")
     if "waveform" not in audio or "sample_rate" not in audio:
-        raise KeyError("AUDIO输入必须包含'waveform'和'sample_rate'。")
+        raise KeyError("音频必须包含 waveform 和 sample_rate")
 
     waveform = audio["waveform"]
     sample_rate = int(audio["sample_rate"])
 
+    torch = _import_torch()
     if not isinstance(waveform, torch.Tensor):
-        waveform = torch.tensor(waveform)
+        waveform = torch.tensor(np.array(waveform), dtype=torch.float32)
 
     waveform = waveform.detach().cpu()
 
-    # 确保波形形状为 [batch, channels, samples] 或 [channels, samples]
     if waveform.dim() == 3:
-        # 如果是 [batch, channels, samples]，取第一个批次
         waveform = waveform[0]
     elif waveform.dim() == 2:
-        # 如果是 [channels, samples]，保持不变
-        pass
+        waveform = waveform[0:1]
     elif waveform.dim() == 1:
-        # 如果是 [samples]，添加通道维度
         waveform = waveform.unsqueeze(0)
     else:
-        raise ValueError(
-            f"不支持的AUDIO波形形状 {tuple(waveform.shape)}。 "
-            "预期为 [batch, channels, samples], [channels, samples], 或 [samples]。"
-        )
+        raise ValueError(f"不支持的音频维度：{waveform.dim()}")
 
     return waveform.float(), sample_rate
 
+def _save_audio(waveform: np.ndarray, sampling_rate: int, prefix: str) -> str:
+    os.makedirs(_OUTPUT_DIR, exist_ok=True)
+    file_name = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.wav"
+    file_path = os.path.join(_OUTPUT_DIR, file_name)
 
-def _to_comfy_audio(waveform, sample_rate):
-    """将生成的音频转换回ComfyUI的AUDIO格式"""
-    waveform = waveform.detach().cpu().float()
-    if waveform.dim() == 1:
-        waveform = waveform.unsqueeze(0)
-    if waveform.dim() != 2:
-        raise ValueError(
-            f"生成的波形必须具有形状 [channels, samples]，得到 {tuple(waveform.shape)}。"
-        )
-    return {
-        "waveform": waveform.unsqueeze(0),
-        "sample_rate": int(sample_rate),
-    }
+    try:
+        waveform = waveform / np.max(np.abs(waveform)) if np.max(np.abs(waveform)) > 0 else waveform
+        wav.write(file_path, sampling_rate, (waveform * 32767).astype(np.int16))
+        logger.info(f"音频已保存：{file_path}")
+        return file_path
+    except Exception as exc:
+        raise IOError(f"保存音频失败：{exc}") from exc
 
-
-def _clean_optional_text(value):
-    """清理可选文本"""
-    if value is None:
-        return None
-    value = str(value).strip()
-    return value or None
-
-
-def _resolve_optional_duration(duration):
-    """处理可选的持续时间"""
-    return float(duration) if duration and float(duration) > 0 else None
-
-
-def _resolve_optional_speed(speed):
-    """处理可选的速度"""
-    speed = float(speed)
-    if speed <= 0:
-        raise ValueError("速度必须大于0。")
-    if abs(speed - 1.0) < 1e-6:
-        return None
-    return speed
-
-
+# ===================== 1. 模型加载节点（中文界面 + 缓存） =====================
 class OmniVoiceModelLoader:
-    def __init__(self):
-        self.model = None
-        self.sampling_rate = None
-
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
         return {
             "required": {
-                "model_path": ("STRING", {"default": "D:/ComfyUI/ComfyUI/models/OmniVoice", "multiline": False}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "模型路径": ("STRING", {
+                    "default": _DEFAULT_OMNIVOICE_DIR,
+                    "multiline": False,
+                    "placeholder": "输入 OmniVoice 模型目录"
+                }),
+                "计算设备": (_SUPPORTED_DEVICES, {"default": "auto"}),
+                "精度": (_SUPPORTED_DTYPES, {"default": "float16"}),
             }
         }
 
     RETURN_TYPES = ("OMNIVOICE_MODEL",)
-    RETURN_NAMES = ("model",)
+    RETURN_NAMES = ("OmniVoice模型",)
     FUNCTION = "load_model"
-    CATEGORY = "OmniVoice"
+    CATEGORY = "OmniVoice TTS"
 
-    def load_model(self, model_path, keep_model_loaded):
-        print(f"正在加载模型从路径: {model_path}")
-        
-        # 设置环境变量
-        os.environ["OMNIVOICE_MODEL"] = model_path
-        
-        # 加载模型
+    def load_model(self, 模型路径: str, 计算设备: str, 精度: str) -> Tuple[Any]:
+        resolved_model_path = _resolve_model_path(模型路径)
+        resolved_device = _resolve_device(计算设备)
+        resolved_dtype = _resolve_dtype(精度)
+        cache_key = (resolved_model_path, resolved_device, 精度)
+
+        with _MODEL_CACHE_LOCK:
+            if cache_key in _MODEL_CACHE:
+                logger.info("从缓存加载模型")
+                return (_MODEL_CACHE[cache_key],)
+
+        OmniVoice, _ = _import_omnivoice()
         model = OmniVoice.from_pretrained(
-            model_path,
-            device_map="cuda",
-            dtype=torch.float16,
-            load_asr=False  # 不加载ASR模型
+            resolved_model_path,
+            device_map=resolved_device,
+            dtype=resolved_dtype,
         )
-        
-        sampling_rate = model.sampling_rate
-        print("模型加载成功!")
-        
-        return ((model, sampling_rate, keep_model_loaded),)
 
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE[cache_key] = model
 
-class OmniVoiceClone:
+        logger.info(f"模型加载完成 | 采样率：{model.sampling_rate}")
+        return (model,)
+
+# ===================== 2. 声音设计节点（匹配你的参考代码） =====================
+class OmniVoiceVoiceDesign:
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
         return {
             "required": {
-                "model_data": ("OMNIVOICE_MODEL",),
-                "text": ("STRING", {"multiline": True, "default": "你好，这是一个测试。"}),
-                "ref_audio": ("AUDIO",),
-                "language": (["Auto", "en", "zh", "ja", "ko", "fr", "es", "de"], {"default": "Auto"}),
-                "num_step": ("INT", {"default": 32, "min": 1, "max": 128}),
-                "guidance_scale": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 20.0}),
-                "denoise": ("BOOLEAN", {"default": True}),
-                "preprocess_prompt": ("BOOLEAN", {"default": True}),
-                "postprocess_output": ("BOOLEAN", {"default": True}),
-                "duration": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0}),
-                "t_shift": ("FLOAT", {"default": 0.10, "min": 0.05, "max": 4.0}),
-                "layer_penalty_factor": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0}),
-                "position_temperature": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0}),
-                "class_temperature": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0}),
-                "audio_chunk_threshold": ("FLOAT", {"default": 30.0, "min": 0.1, "max": 600.0}),
+                "模型": ("OMNIVOICE_MODEL",),
+                "合成文本": ("STRING", {
+                    "default": "你好，这是 OmniVoice 声音设计",
+                    "multiline": True
+                }),
+                "语言": (_SUPPORTED_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
-                "ref_text": ("STRING", {"multiline": True}),
-                "speed": ("FLOAT", {"default": 1.0, "min": 0.05, "max": 8.0}),
+                "生成步数": ("INT", {"default": 32, "min": 1, "max": 128}),
+                "指导尺度": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0}),
+                "去噪": ("BOOLEAN", {"default": True}),
+                "语速": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0}),
+                "音频时长": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 60.0}),
+                "声音设计指令": ("STRING", {"default": "female, low pitch", "multiline": True}),
+                "运行后卸载模型": ("BOOLEAN", {"default": False}),
             }
         }
 
-    RETURN_TYPES = ("AUDIO", "STRING")
-    RETURN_NAMES = ("audio", "status_message")
-    FUNCTION = "generate_clone"
-    CATEGORY = "OmniVoice"
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("音频数据",)
+    FUNCTION = "generate"
+    CATEGORY = "OmniVoice TTS"
 
-    def generate_clone(self, model_data, text, ref_audio, language, num_step, guidance_scale, denoise, 
-                      preprocess_prompt, postprocess_output, duration, t_shift, layer_penalty_factor, 
-                      position_temperature, class_temperature, audio_chunk_threshold, 
-                      ref_text=None, speed=1.0):
-        
-        model, sampling_rate, keep_model_loaded = model_data
+    def generate(
+        self, 模型: Any, 合成文本: str, 语言: str,
+        生成步数=32, 指导尺度=2.0, 去噪=True, 语速=1.0, 音频时长=0.0,
+        声音设计指令="", 运行后卸载模型=False
+    ):
+        合成文本 = 合成文本.strip()
+        if not 合成文本:
+            raise ValueError("合成文本不能为空！")
 
-        if not text or not text.strip():
-            # 创建一个空的音频对象作为错误处理
-            empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-            empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-            return (empty_audio, "请输入要合成的文本。")
-
-        if ref_audio is None:
-            # 创建一个空的音频对象作为错误处理
-            empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-            empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-            return (empty_audio, "请提供参考音频用于声音克隆。")
-
+        _, OmniVoiceGenerationConfig = _import_omnivoice()
         gen_config = OmniVoiceGenerationConfig(
-            num_step=int(num_step),
-            guidance_scale=float(guidance_scale),
-            t_shift=float(t_shift),
-            layer_penalty_factor=float(layer_penalty_factor),
-            position_temperature=float(position_temperature),
-            class_temperature=float(class_temperature),
-            denoise=bool(denoise),
-            preprocess_prompt=bool(preprocess_prompt),
-            postprocess_output=bool(postprocess_output),
-            audio_chunk_threshold=float(audio_chunk_threshold),
+            num_step=生成步数, guidance_scale=指导尺度, denoise=去噪
         )
 
-        lang = language if (language and language != "Auto") else None
-
-        kw = {
-            "text": text.strip(),
-            "language": lang,
+        gen_kwargs = {
+            "text": 合成文本,
+            "language": 语言 if 语言 != "Auto" else None,
             "generation_config": gen_config
         }
+        if 语速 != 1.0: gen_kwargs["speed"] = 语速
+        if 音频时长 > 0: gen_kwargs["duration"] = 音频时长
+        if 声音设计指令.strip(): gen_kwargs["instruct"] = 声音设计指令.strip()
 
-        duration_value = _resolve_optional_duration(duration)
-        speed_value = None if duration_value is not None else _resolve_optional_speed(speed)
+        audio = 模型.generate(**gen_kwargs)
+        torch = _import_torch()
+        waveform = torch.squeeze(audio[0]).cpu().numpy()
+        _save_audio(waveform, 模型.sampling_rate, "design")
 
-        if speed_value is not None:
-            kw["speed"] = speed_value
-        if duration_value is not None:
-            kw["duration"] = duration_value
+        # 转换为ComfyUI期望的音频格式
+        waveform_tensor = torch.from_numpy(waveform).float()
+        # 确保维度为 [batch, channels, samples]
+        if waveform_tensor.dim() == 1:
+            waveform_tensor = waveform_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, samples]
+        elif waveform_tensor.dim() == 2:
+            waveform_tensor = waveform_tensor.unsqueeze(0)  # [1, channels, samples]
 
-        # 转换音频格式为OmniVoice接受的格式
-        try:
-            ref_audio_tensor, ref_sample_rate = _to_audio_tuple(ref_audio)
-        except Exception as e:
-            # 创建一个空的音频对象作为错误处理
-            empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-            empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-            return (empty_audio, f"音频格式错误: {str(e)}")
-        
-        # 确保音频是单声道
-        if ref_audio_tensor.shape[0] > 1:
-            ref_audio_tensor = ref_audio_tensor[0:1, :]  # 取第一个声道
-        elif ref_audio_tensor.dim() == 1:
-            ref_audio_tensor = ref_audio_tensor.unsqueeze(0)
+        audio_output = {
+            "waveform": waveform_tensor,
+            "sample_rate": 模型.sampling_rate
+        }
 
-        try:
-            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-                ref_audio=(ref_audio_tensor, ref_sample_rate),
-                ref_text=ref_text
-            )
-        except Exception as e:
-            # 创建一个空的音频对象作为错误处理
-            empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-            empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-            return (empty_audio, f"创建声音克隆提示失败: {str(e)}")
+        # 显存管理
+        if 运行后卸载模型:
+            with _MODEL_CACHE_LOCK:
+                for k in list(_MODEL_CACHE.keys()):
+                    if _MODEL_CACHE[k] == 模型: del _MODEL_CACHE[k]
+            torch.cuda.empty_cache()
 
-        # 执行音频生成
-        try:
-            audio = model.generate(**kw)
-            if audio is None or len(audio) == 0:
-                # 创建一个空的音频对象作为错误处理
-                empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-                empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-                return (empty_audio, "生成失败：返回了空音频")
-                
-            waveform = audio[0].squeeze(0).cpu()
-            
-            # 检查生成的音频是否为空
-            if waveform.numel() == 0:
-                # 创建一个空的音频对象作为错误处理
-                empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-                empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-                return (empty_audio, "生成失败：音频长度为0")
-            
-            # 保存音频文件
-            output_dir = "output"
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
+        return (audio_output,)
 
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            file_path = os.path.join(output_dir, f"omnivoice_clone_{timestamp}.wav")
-            waveform_np = waveform.numpy()
-            waveform_int16 = (waveform_np * 32767).astype(np.int16)
-            wav.write(file_path, sampling_rate, waveform_int16)
-            
-            # 返回音频数据和状态信息
-            audio_data = _to_comfy_audio(waveform, sampling_rate)
-            
-            return (audio_data, f"音频已生成并保存至: {file_path}")
-            
-        except Exception as e:
-            # 创建一个空的音频对象作为错误处理
-            empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-            empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-            error_msg = f"生成失败: {type(e).__name__}: {str(e)}"
-            return (empty_audio, error_msg)
-
-
-class OmniVoiceDesign:
+# ===================== 3. 声音克隆节点（修复错误） =====================
+class OmniVoiceVoiceClone:
     @classmethod
-    def INPUT_TYPES(cls):
-        # 由于无法导入OmniVoice内部模块，我们使用通用的语音设计参数
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
         return {
             "required": {
-                "model_data": ("OMNIVOICE_MODEL",),
-                "text": ("STRING", {"multiline": True, "default": "你好，这是一个测试。"}),
-                "language": (["Auto", "en", "zh", "ja", "ko", "fr", "es", "de"], {"default": "Auto"}),
-                "num_step": ("INT", {"default": 32, "min": 1, "max": 128}),
-                "guidance_scale": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 20.0}),
-                "denoise": ("BOOLEAN", {"default": True}),
-                "preprocess_prompt": ("BOOLEAN", {"default": True}),
-                "postprocess_output": ("BOOLEAN", {"default": True}),
-                "duration": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0}),
-                "t_shift": ("FLOAT", {"default": 0.10, "min": 0.05, "max": 4.0}),
-                "layer_penalty_factor": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0}),
-                "position_temperature": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0}),
-                "class_temperature": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0}),
-                "audio_chunk_threshold": ("FLOAT", {"default": 30.0, "min": 0.1, "max": 600.0}),
-                "gender": (["none", "male", "female"], {"default": "none"}),
-                "age": (["none", "child", "teenager", "young adult", "middle-aged", "elderly"], {"default": "none"}),
-                "pitch": (["none", "very low pitch", "low pitch", "moderate pitch", "high pitch", "very high pitch"], {"default": "none"}),
-                "style": (["none", "whisper"], {"default": "none"}),
-                "accent": (["none", "american", "british", "australian", "indian", "chinese", "japanese", "korean"], {"default": "none"}),
-                "dialect": (["none", "henan", "shaanxi", "sichuan", "guizhou", "yunnan", "guilin", "jinan", "shijiazhuang", "gansu", "ningxia", "qingdao", "northeast"], {"default": "none"}),
+                "模型": ("OMNIVOICE_MODEL",),
+                "合成文本": ("STRING", {"multiline": True}),
+                "参考音频": ("AUDIO",),
+                "参考文本": ("STRING", {"multiline": True}),
+                "语言": (_SUPPORTED_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
-                "custom_attributes": ("STRING", {"multiline": True}),
-                "speed": ("FLOAT", {"default": 1.0, "min": 0.05, "max": 8.0}),
+                "生成步数": ("INT", {"default": 32}),
+                "指导尺度": ("FLOAT", {"default": 2.0}),
+                "语速": ("FLOAT", {"default": 1.0}),
+                "运行后卸载模型": ("BOOLEAN", {"default": False}),
             }
         }
 
-    RETURN_TYPES = ("AUDIO", "STRING")
-    RETURN_NAMES = ("audio", "status_message")
-    FUNCTION = "generate_design"
-    CATEGORY = "OmniVoice"
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("音频数据",)
+    FUNCTION = "generate"
+    CATEGORY = "OmniVoice TTS"
 
-    def generate_design(self, model_data, text, language, num_step, guidance_scale, denoise, 
-                       preprocess_prompt, postprocess_output, duration, t_shift, layer_penalty_factor, 
-                       position_temperature, class_temperature, audio_chunk_threshold,
-                       gender, age, pitch, style, accent, dialect,
-                       custom_attributes="", speed=1.0):
+    def generate(
+        self, 模型: Any, 合成文本: str, 参考音频: dict, 参考文本: str, 语言: str,
+        生成步数=32, 指导尺度=2.0, 语速=1.0, 运行后卸载模型=False
+    ):
+        合成文本 = 合成文本.strip()
+        if not 合成文本:
+            raise ValueError("合成文本不能为空！")
         
-        model, sampling_rate, keep_model_loaded = model_data
-
-        if not text or not text.strip():
-            # 创建一个空的音频对象作为错误处理
-            empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-            empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-            return (empty_audio, "请输入要合成的文本。")
-
-        gen_config = OmniVoiceGenerationConfig(
-            num_step=int(num_step),
-            guidance_scale=float(guidance_scale),
-            t_shift=float(t_shift),
-            layer_penalty_factor=float(layer_penalty_factor),
-            position_temperature=float(position_temperature),
-            class_temperature=float(class_temperature),
-            denoise=bool(denoise),
-            preprocess_prompt=bool(preprocess_prompt),
-            postprocess_output=bool(postprocess_output),
-            audio_chunk_threshold=float(audio_chunk_threshold),
-        )
-
-        lang = language if (language and language != "Auto") else None
-
-        # 构建声音描述
-        voice_parts = []
+        # 正确提取参考音频的波形和采样率
+        ref_waveform = 参考音频["waveform"]
+        ref_sample_rate = int(参考音频["sample_rate"])
         
-        if gender != "none":
-            voice_parts.append(gender)
-        if age != "none":
-            voice_parts.append(age)
-        if pitch != "none":
-            voice_parts.append(pitch)
-        if style != "none":
-            voice_parts.append(style)
-        if accent != "none":
-            voice_parts.append(f"{accent} accent")
-        if dialect != "none":
-            voice_parts.append(f"{dialect} dialect")
+        # 确保波形是正确的张量格式
+        torch = _import_torch()
+        if not isinstance(ref_waveform, torch.Tensor):
+            ref_waveform = torch.tensor(ref_waveform.numpy())
         
-        # 添加自定义属性
-        if custom_attributes.strip():
-            custom_parts = [
-                item.strip()
-                for item in custom_attributes.replace("\n", ",").split(",")
-                if item.strip()
-            ]
-            voice_parts.extend(custom_parts)
-
-        # 构建instruct字符串，如果没有任何描述则设为None
-        instruct = ", ".join(voice_parts) if voice_parts else None
-
-        kw = {
-            "text": text.strip(),
-            "language": lang,
-            "generation_config": gen_config,
-        }
+        # 确保波形维度正确
+        if ref_waveform.dim() == 3:
+            ref_waveform = ref_waveform[0]
+        elif ref_waveform.dim() == 2:
+            ref_waveform = ref_waveform[0]  # 取第一个声道
         
-        if instruct:
-            kw["instruct"] = instruct
+        # 将参考音频移到模型设备上
+        ref_waveform = ref_waveform.to(模型.device)
 
-        duration_value = _resolve_optional_duration(duration)
-        speed_value = None if duration_value is not None else _resolve_optional_speed(speed)
+        _, OmniVoiceGenerationConfig = _import_omnivoice()
+        gen_config = OmniVoiceGenerationConfig(num_step=生成步数, guidance_scale=指导尺度)
 
-        if speed_value is not None:
-            kw["speed"] = speed_value
-        if duration_value is not None:
-            kw["duration"] = duration_value
-
-        # 执行音频生成
+        # 修复声音克隆方法调用
         try:
-            audio = model.generate(**kw)
-            if audio is None or len(audio) == 0:
-                # 创建一个空的音频对象作为错误处理
-                empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-                empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-                return (empty_audio, "生成失败：返回了空音频")
-                
-            waveform = audio[0].squeeze(0).cpu()
-            
-            # 检查生成的音频是否为空
-            if waveform.numel() == 0:
-                # 创建一个空的音频对象作为错误处理
-                empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-                empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-                return (empty_audio, "生成失败：音频长度为0")
-            
-            # 保存音频文件
-            output_dir = "output"
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            file_path = os.path.join(output_dir, f"omnivoice_design_{timestamp}.wav")
-            waveform_np = waveform.numpy()
-            waveform_int16 = (waveform_np * 32767).astype(np.int16)
-            wav.write(file_path, sampling_rate, waveform_int16)
-            
-            # 返回音频数据和状态信息
-            audio_data = _to_comfy_audio(waveform, sampling_rate)
-            
-            return (audio_data, f"音频已生成并保存至: {file_path}")
-            
+            # 正确格式化参考音频参数
+            ref_audio_tuple = (ref_waveform, ref_sample_rate)
+            clone_prompt = 模型.create_voice_clone_prompt(
+                ref_audio=ref_audio_tuple, 
+                ref_text=参考文本 or ""
+            )
         except Exception as e:
-            # 创建一个空的音频对象作为错误处理
-            empty_waveform = torch.zeros((1, 100))  # 1 channel, 100 samples
-            empty_audio = _to_comfy_audio(empty_waveform, sampling_rate)
-            error_msg = f"生成失败: {type(e).__name__}: {str(e)}"
-            return (empty_audio, error_msg)
+            raise RuntimeError(f"创建声音克隆提示失败: {str(e)}")
 
+        # 生成音频
+        try:
+            audio = 模型.generate(
+                text=合成文本,
+                language=语言 if 语言 != "Auto" else None,
+                voice_clone_prompt=clone_prompt,
+                speed=语速,
+                generation_config=gen_config
+            )
+        except Exception as e:
+            raise RuntimeError(f"生成音频失败: {str(e)}")
 
-# 注册节点
+        # 处理生成的音频
+        waveform = torch.squeeze(audio[0]).cpu().numpy()
+        _save_audio(waveform, 模型.sampling_rate, "clone")
+
+        # 转换为ComfyUI期望的音频格式
+        waveform_tensor = torch.from_numpy(waveform).float()
+        # 确保维度为 [batch, channels, samples]
+        if waveform_tensor.dim() == 1:
+            waveform_tensor = waveform_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, samples]
+        elif waveform_tensor.dim() == 2:
+            waveform_tensor = waveform_tensor.unsqueeze(0)  # [1, channels, samples]
+
+        audio_output = {
+            "waveform": waveform_tensor,
+            "sample_rate": 模型.sampling_rate
+        }
+
+        if 运行后卸载模型:
+            with _MODEL_CACHE_LOCK:
+                for k in list(_MODEL_CACHE.keys()):
+                    if _MODEL_CACHE[k] == 模型: del _MODEL_CACHE[k]
+            torch.cuda.empty_cache()
+
+        return (audio_output,)
+
+# ===================== 节点注册（完全匹配你的参考代码） =====================
 NODE_CLASS_MAPPINGS = {
     "OmniVoiceModelLoader": OmniVoiceModelLoader,
-    "OmniVoiceClone": OmniVoiceClone,
-    "OmniVoiceDesign": OmniVoiceDesign
+    "OmniVoiceVoiceDesign": OmniVoiceVoiceDesign,
+    "OmniVoiceVoiceClone": OmniVoiceVoiceClone
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "OmniVoiceModelLoader": "OmniVoice 模型加载器",
-    "OmniVoiceClone": "OmniVoice 声音克隆",
-    "OmniVoiceDesign": "OmniVoice 声音设计"
+    "OmniVoiceModelLoader": "OmniVoice 模型加载",
+    "OmniVoiceVoiceDesign": "OmniVoice 声音设计",
+    "OmniVoiceVoiceClone": "OmniVoice 声音克隆"
 }
+
+# 初始化模型文件夹
+def _init():
+    folder_paths = _get_folder_paths_module()
+    if folder_paths:
+        try:
+            folder_paths.add_model_folder_path("omnivoice", _DEFAULT_OMNIVOICE_DIR)
+        except:
+            pass
+_init()
